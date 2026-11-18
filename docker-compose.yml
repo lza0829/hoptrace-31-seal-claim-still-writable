@@ -1,0 +1,19 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "10800:10800"
+    volumes:
+      - hoptrace_data:/data
+      - ./fixtures:/fixtures:ro
+    environment:
+      DATA_DIR: /data
+      FIXTURES_DIR: /fixtures
+  frontend:
+    build: ./frontend
+    ports:
+      - "5800:80"
+    depends_on:
+      - backend
+volumes:
+  hoptrace_data:

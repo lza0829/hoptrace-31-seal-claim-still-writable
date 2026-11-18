@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+backend/data/
+*.db
+.DS_Store
+.idea/
+.vscode/
