@@ -13,7 +13,7 @@ const err = ref('')
 async function loadAll() {
   seals.value = await api.seals()
   audit.value = await api.sealAudit()
-  // 每个封印态证明实时校验：证明与正式线内容互证
+  // 每个封印态证明实时核证：现场重算指纹 + 最近核对证明，任一不对应都不给绿灯
   for (const s of seals.value.filter((x) => x.status === 'sealed')) {
     await verifyOne(s.waybill_id)
   }
@@ -21,14 +21,43 @@ async function loadAll() {
 
 async function verifyOne(id) {
   try {
-    const p = await api.sealProof(id)
-    checks.value[id] = {
-      status: p.verified ? 'ok' : 'unknown',
-      detail: p.verified ? '哈希互证一致' : '未封印/已解封',
-      hash: p.current_hash,
+    const p = await api.reconcileAttest(id)
+    if (p.verified === true) {
+      checks.value[id] = {
+        status: 'ok',
+        detail: `核对通过 · ${p.reconciliation?.checked_at || ''}`,
+        hash: p.current_hash,
+        reconciled: true,
+      }
+    } else if (p.status !== 'sealed') {
+      checks.value[id] = { status: 'unknown', detail: '已解封', hash: null, reconciled: false }
+    } else {
+      // 现场一致但尚未核对/核对证明与当前指纹不对应：不是绿灯
+      checks.value[id] = {
+        status: 'pending',
+        detail: p.reason || '待核对',
+        hash: p.current_hash,
+        reconciled: false,
+      }
     }
   } catch (e) {
-    checks.value[id] = { status: 'tamper', detail: String(e.message || e), hash: null }
+    // 现场指纹与封存值分叉：核证接口失败闭，绿灯必须熄灭
+    checks.value[id] = { status: 'tamper', detail: String(e.message || e), hash: null, reconciled: false }
+  }
+}
+
+async function reconcileNow(id) {
+  busy.value = true
+  err.value = ''
+  try {
+    await api.reconcile(id)
+    await loadAll()
+  } catch (e) {
+    err.value = String(e.message || e)
+    // 核对失败闭：刷新核证灯，展示现场与封存值对不上
+    await verifyOne(id)
+  } finally {
+    busy.value = false
   }
 }
 
@@ -76,8 +105,9 @@ function actionLabel(a) {
   <div class="page-card">
     <h1>封存证明</h1>
     <p class="lead">
-      时间线哈希封存：封存瞬间固化点序内容哈希与投影快照；封印后正式有效线写入/更正由写闸拒绝，
-      读路径用封存哈希校验，篡改即拒绝返回。当前封印运单 {{ sealedCount }} 单。
+      时间线哈希封存：封存瞬间固化点序内容哈希与投影快照；封印后正式有效线写入/更正由写闸拒绝。
+      内容核对必须现场重算正式线指纹并与封存值比对，一致才落核对证明，不一致失败闭。
+      当前封印运单 {{ sealedCount }} 单。
     </p>
 
     <p v-if="err" class="muted seal-err">{{ err }}</p>
@@ -86,7 +116,7 @@ function actionLabel(a) {
       <thead>
         <tr>
           <th>运单</th><th>状态</th><th>内容哈希</th><th>点数</th><th>投影</th>
-          <th>封印时刻</th><th>校验</th><th>操作</th>
+          <th>封印时刻</th><th>核对核证</th><th>操作</th>
         </tr>
       </thead>
       <tbody>
@@ -104,12 +134,18 @@ function actionLabel(a) {
           <td>
             <template v-if="s.status === 'sealed'">
               <span class="seal-check" :class="checks[s.waybill_id]?.status">
-                {{ checks[s.waybill_id]?.detail || '校验中…' }}
+                {{ checks[s.waybill_id]?.detail || '核证中…' }}
               </span>
             </template>
             <span v-else class="muted">—</span>
           </td>
           <td>
+            <button
+              v-if="s.status === 'sealed'"
+              class="btn btn-sm btn-ghost"
+              :disabled="busy"
+              @click="reconcileNow(s.waybill_id)"
+            >内容核对</button>
             <button
               v-if="s.status === 'sealed'"
               class="btn btn-sm btn-danger"
@@ -188,6 +224,8 @@ function actionLabel(a) {
 }
 .seal-check { font-size: 12px; font-family: var(--mono); }
 .seal-check.ok { color: var(--mint); }
+.seal-check.pending { color: var(--amber); }
+.seal-check.unknown { color: var(--muted); }
 .seal-check.tamper { color: var(--danger); }
 .hash-cell {
   font-family: var(--mono);

@@ -36,4 +36,14 @@ export const api = {
         ? `/api/seals/audit/log?waybill_id=${encodeURIComponent(waybillId)}`
         : '/api/seals/audit/log',
     ),
+  // 内容核对：现场重算正式线指纹并与封存值比对；不一致由后端 409 失败闭
+  reconcile: (waybillId, actor = 'manual') =>
+    req(`/api/seals/${encodeURIComponent(waybillId)}/reconcile`, {
+      method: 'POST',
+      body: JSON.stringify({ actor }),
+    }),
+  reconcileAttest: (waybillId) =>
+    req(`/api/seals/${encodeURIComponent(waybillId)}/reconcile/attest`),
+  reconcileProofs: (waybillId) =>
+    req(`/api/seals/${encodeURIComponent(waybillId)}/reconcile/proofs`),
 }

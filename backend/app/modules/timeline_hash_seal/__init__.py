@@ -11,6 +11,14 @@
 - 封印后正式有效线（hops channel='primary' 且 retracted=0）写入/更正一律拒绝，
   除非显式解封（必须带 reason）并留审计。
 - 读路径用封存哈希重算校验，内容或投影被篡改则拒绝返回。
+
+内容核对（核对核证）：
+- 核对必须**现场重算**正式有效线指纹，并与封印行 content_hash、快照内嵌指纹
+  逐项比对；任何不一致一律失败闭（抛 SealTamperError），绝不返回「通过」。
+- 落库形态：只追加的核对结果证明表 seal_reconciliations（不是页面文案）。
+- 提交形态：先写核对草稿（outcome='draft'）→ 现场重算比对 → 一致才把草稿
+  原子转成核对证明（outcome='passed'）并随调用方事务提交；不一致则删除草稿
+  并抛错，调用方回滚后库里不留任何半截核对。
 """
 from __future__ import annotations
 
@@ -208,7 +216,12 @@ def unseal_waybill(conn, waybill_id: str, reason: str, actor: str = "manual") ->
 
 
 def verify_seal(conn, waybill_id: str) -> dict:
-    """用封存哈希校验当前正式线内容与投影，篡改则抛 SealTamperError。"""
+    """用封存哈希校验当前正式线内容与投影，篡改则抛 SealTamperError。
+
+    核对口径：**现场重算**正式有效线指纹（不信封存行里的旧值），再与
+    封印行 content_hash、快照内嵌指纹、点数、投影逐项比对。
+    只要有任一项对不上，就抛 SealTamperError 失败闭——绝不在对不上时返回通过。
+    """
     seal = conn.execute(
         "SELECT * FROM timeline_seals WHERE waybill_id=?", (waybill_id,)
     ).fetchone()
@@ -236,12 +249,115 @@ def verify_seal(conn, waybill_id: str) -> dict:
             f"投影不一致：封存 {seal['projection']!r} / 当前 {live_projection!r}"
         )
 
+    # 失败闭：任何不一致都必须抛错，不能只把 mismatches 挂在成功回执上。
+    if mismatches:
+        raise SealTamperError(waybill_id, mismatches, seal["content_hash"], live_hash)
+
     return {
         **_proof_row(seal),
         "verified": True,
         "current_hash": live_hash,
         "mismatches": mismatches,
     }
+
+
+def reconcile_seal(conn, waybill_id: str, actor: str = "manual") -> dict:
+    """内容核对：现场重算正式线指纹 → 与封存值比对 → 一致才原子落核对证明。
+
+    提交形态（先草稿后证明）：
+    1. 先写一条 outcome='draft' 的核对草稿行（记录封印指纹与核对时刻）。
+    2. 现场重算正式线指纹，连同点数、投影、快照内嵌指纹逐项比对。
+    3. 一致：把草稿原子转成 outcome='passed' 并回读证明；随后随调用方事务提交。
+       不一致：删除草稿并抛 SealTamperError，调用方回滚，库里不留半截核对。
+
+    核对对象必须是封印态运单：未封印/已解封没有可核对的封存值，抛 SealError。
+    """
+    seal = conn.execute(
+        "SELECT * FROM timeline_seals WHERE waybill_id=?", (waybill_id,)
+    ).fetchone()
+    if not seal:
+        raise SealError(f"运单 {waybill_id} 无封存记录，无法核对")
+    if seal["status"] != "sealed":
+        raise SealError(f"运单 {waybill_id} 当前不是封印态，无可核对的封存值")
+
+    checked_at = utc_now()
+    cur = conn.execute(
+        """
+        INSERT INTO seal_reconciliations(
+          waybill_id, content_hash, recomputed_hash, point_count, projection,
+          outcome, mismatches_json, checked_at, checked_by
+        ) VALUES (?,?,?,?,?, 'draft', '[]', ?, ?)
+        """,
+        (waybill_id, seal["content_hash"], None, seal["point_count"],
+         seal["projection"], checked_at, actor),
+    )
+    draft_id = cur.lastrowid
+
+    live_hops = canonical_hops(conn, waybill_id)
+    live_hash = compute_content_hash(live_hops)
+    snapshot = json.loads(seal["snapshot_json"])
+    snapshot_hash = compute_content_hash(snapshot["hops"])
+    wb = _get_waybill(conn, waybill_id)
+    live_projection = wb["status_proj"] if wb else None
+
+    mismatches: list[str] = []
+    if seal["content_hash"] != snapshot_hash:
+        mismatches.append("封存哈希与快照内嵌指纹不一致（封存行自身被改）")
+    if seal["content_hash"] != live_hash:
+        mismatches.append("正式线点序内容哈希与封存值不一致（现场点序已被改）")
+    if seal["point_count"] != len(live_hops):
+        mismatches.append(
+            f"点数不一致：封存 {seal['point_count']} / 当前 {len(live_hops)}"
+        )
+    if seal["projection"] != live_projection:
+        mismatches.append(
+            f"投影不一致：封存 {seal['projection']!r} / 当前 {live_projection!r}"
+        )
+
+    if mismatches:
+        # 草稿不保留：删除后抛错，调用方回滚，库里无「核对通过」假证明。
+        conn.execute("DELETE FROM seal_reconciliations WHERE id=?", (draft_id,))
+        raise SealTamperError(waybill_id, mismatches, seal["content_hash"], live_hash)
+
+    # 一致：原子把草稿转成核对证明，并写全现场重算值。
+    conn.execute(
+        """
+        UPDATE seal_reconciliations
+        SET recomputed_hash=?, point_count=?, projection=?, outcome='passed'
+        WHERE id=? AND outcome='draft'
+        """,
+        (live_hash, len(live_hops), live_projection, draft_id),
+    )
+    proof = conn.execute(
+        "SELECT * FROM seal_reconciliations WHERE id=?", (draft_id,)
+    ).fetchone()
+    if not proof or proof["outcome"] != "passed":
+        raise SealError(f"运单 {waybill_id} 核对证明回读校验失败，事务应回滚")
+    return _reconcile_row(proof)
+
+
+def latest_reconciliation(conn, waybill_id: str):
+    """最近一次核对证明（passed）；草稿不会落库留存，故必为已通过证明。"""
+    return conn.execute(
+        "SELECT * FROM seal_reconciliations WHERE waybill_id=? AND outcome='passed' "
+        "ORDER BY id DESC LIMIT 1",
+        (waybill_id,),
+    ).fetchone()
+
+
+def list_reconciliations(conn, waybill_id: str | None = None) -> list[dict]:
+    if waybill_id:
+        rows = conn.execute(
+            "SELECT * FROM seal_reconciliations WHERE waybill_id=? AND outcome='passed' "
+            "ORDER BY id DESC",
+            (waybill_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM seal_reconciliations WHERE outcome='passed' ORDER BY id DESC LIMIT 100"
+        ).fetchall()
+    return [_reconcile_row(r) for r in rows]
+
 
 
 def get_seal(conn, waybill_id: str):
@@ -265,6 +381,77 @@ def list_audit(conn, waybill_id: str | None = None) -> list[dict]:
     else:
         rows = conn.execute("SELECT * FROM seal_audit_log ORDER BY id DESC LIMIT 100").fetchall()
     return [dict(r) for r in rows]
+
+
+def _reconcile_row(row) -> dict:
+    return {
+        "id": row["id"],
+        "waybill_id": row["waybill_id"],
+        "content_hash": row["content_hash"],
+        "recomputed_hash": row["recomputed_hash"],
+        "point_count": row["point_count"],
+        "projection": row["projection"],
+        "outcome": row["outcome"],
+        "mismatches": json.loads(row["mismatches_json"] or "[]"),
+        "checked_at": row["checked_at"],
+        "checked_by": row["checked_by"],
+    }
+
+
+def attest_reconciliation(conn, waybill_id: str) -> dict:
+    """只读核对核证：最近核对证明 + 现场再算复核。
+
+    「通过」必须同时满足，否则绝不返回 verified=True：
+    1. 运单当前处于封印态；
+    2. 现场重算指纹仍等于封存值（verify_seal 不抛错）；
+    3. 存在最近一次 passed 核对证明，且其 content_hash 对应当前封印行、
+       recomputed_hash 对应当前现场指纹——内嵌指纹与现场不得分叉。
+    现场指纹已变（封印后被改点序等）时 verify_seal 直接抛错，由路由层 409 失败闭。
+    """
+    seal = conn.execute(
+        "SELECT * FROM timeline_seals WHERE waybill_id=?", (waybill_id,)
+    ).fetchone()
+    if not seal:
+        raise SealError(f"运单 {waybill_id} 无封存记录")
+
+    latest = latest_reconciliation(conn, waybill_id)
+    latest_row = _reconcile_row(latest) if latest else None
+    if seal["status"] != "sealed":
+        return {
+            "waybill_id": waybill_id,
+            "status": seal["status"],
+            "verified": None,
+            "reason": "运单已解封，无可核对封存值",
+            "content_hash": seal["content_hash"],
+            "current_hash": None,
+            "reconciliation": latest_row,
+        }
+
+    # 现场重算复核：指纹一旦分叉立即抛错，绝不给绿灯。
+    verification = verify_seal(conn, waybill_id)
+    live_hash = verification["current_hash"]
+
+    result = {
+        "waybill_id": waybill_id,
+        "status": "sealed",
+        "content_hash": seal["content_hash"],
+        "current_hash": live_hash,
+        "reconciliation": latest_row,
+        "verified": False,
+        "reason": None,
+    }
+    if latest_row is None:
+        result["reason"] = "尚未核对"
+        return result
+    if (
+        latest_row["content_hash"] != seal["content_hash"]
+        or latest_row["recomputed_hash"] != live_hash
+    ):
+        result["reason"] = "最近核对证明与当前封印/现场指纹不对应（重封或内容变更后需重新核对）"
+        return result
+
+    result["verified"] = True
+    return result
 
 
 def _proof_row(row) -> dict:

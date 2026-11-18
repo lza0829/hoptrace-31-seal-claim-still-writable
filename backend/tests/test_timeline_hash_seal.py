@@ -304,3 +304,176 @@ def test_audit_and_list_endpoints(client):
     assert r.status_code == 200
     actions = {a["action"] for a in r.json()}
     assert {"seal", "unseal", "ingest_blocked"} <= actions
+
+
+# ---------- 6. 内容核对：现场重算比对、失败闭、核对证明落库、只读核证 ----------
+
+def _recon_rows(conn, wid):
+    return conn.execute(
+        "SELECT * FROM seal_reconciliations WHERE waybill_id=? ORDER BY id", (wid,)
+    ).fetchall()
+
+
+def test_attest_before_any_reconciliation_is_not_green(client):
+    """封印后尚未核对：核证接口不得直接给通过。"""
+    r = client.get("/api/seals/WB-1001/reconcile/attest")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "sealed"
+    assert body["verified"] is False
+    assert body["reconciliation"] is None
+    assert body["reason"] == "尚未核对"
+    # 现场重算值仍然如实给出，供人工比对
+    assert body["current_hash"] == body["content_hash"]
+
+
+def test_reconcile_recomputes_and_persists_proof(client):
+    r = client.post("/api/seals/WB-1001/reconcile", json={"actor": "auditor"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    rec = body["reconciliation"]
+    assert rec["waybill_id"] == "WB-1001"
+    assert rec["outcome"] == "passed"
+    assert rec["content_hash"] == rec["recomputed_hash"]
+    assert rec["point_count"] == 4
+    assert rec["mismatches"] == []
+    assert rec["checked_by"] == "auditor"
+
+    conn = connect()
+    try:
+        rows = _recon_rows(conn, "WB-1001")
+        # 落库只有通过证明，没有草稿残留
+        assert len(rows) == 1
+        assert rows[0]["outcome"] == "passed"
+        assert rows[0]["recomputed_hash"] == rows[0]["content_hash"]
+    finally:
+        conn.close()
+
+    # 只读核证：最近核对证明与现场指纹对应，才给绿灯
+    ra = client.get("/api/seals/WB-1001/reconcile/attest")
+    assert ra.status_code == 200, ra.text
+    att = ra.json()
+    assert att["verified"] is True
+    assert att["reason"] is None
+    assert att["reconciliation"]["id"] == rec["id"]
+    assert att["reconciliation"]["recomputed_hash"] == att["current_hash"] == att["content_hash"]
+
+    # 已通过核对仍不解除写闸：装载继续被拒
+    assert client.post("/api/ingest/run").json()["ok"] is False
+
+
+def test_fixture_point_order_changed_after_seal_fails_reconcile(client):
+    """夹具在封印后改点序：核对必须失败（409），且不落任何通过证明。"""
+    conn = connect()
+    try:
+        before = len(_recon_rows(conn, "WB-1001"))
+        original_ts = conn.execute(
+            "SELECT event_ts FROM hops WHERE id='H-2'"
+        ).fetchone()["event_ts"]
+        # 改点序：把 H-2 的时间挪到最后，正式有效线顺序发生变化、指纹随之改变
+        conn.execute(
+            "UPDATE hops SET event_ts='2026-11-17T23:59:00Z' WHERE id='H-2'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 内容核对：现场重算指纹与封存值不一致 → 409 失败闭
+    r = client.post("/api/seals/WB-1001/reconcile", json={"actor": "auditor"})
+    assert r.status_code == 409, r.text
+    assert "封存校验失败" in r.json()["detail"]
+
+    # 不得写入「通过」核对证明，也不留草稿
+    conn = connect()
+    try:
+        rows = _recon_rows(conn, "WB-1001")
+        assert len(rows) == before
+        assert all(row["outcome"] == "passed" for row in rows)
+    finally:
+        conn.close()
+
+    # 只读核证同样失败闭：现场指纹已分叉，绝不返回绿灯
+    ra = client.get("/api/seals/WB-1001/reconcile/attest")
+    assert ra.status_code == 409
+    assert "封存校验失败" in ra.json()["detail"]
+
+    # 复原夹具点序
+    conn = connect()
+    try:
+        conn.execute("UPDATE hops SET event_ts=? WHERE id='H-2'", (original_ts,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 复原后核证恢复绿灯（既有核对证明仍对应当前指纹）
+    assert client.get("/api/seals/WB-1001/reconcile/attest").json()["verified"] is True
+
+
+def test_reconcile_requires_sealed_waybill(client):
+    # 从未封存的运单没有可核对封存值
+    r = client.post("/api/seals/NOPE/reconcile", json={})
+    assert r.status_code == 404
+
+
+def test_reconcile_on_unsealed_waybill_is_rejected(client):
+    """解封后无法核对：封存值已翻状态，核对接口拒绝并在核证中如实返回。"""
+    r = client.request(
+        "DELETE", "/api/seals/WB-1002", json={"reason": "核对前置用例"}
+    )
+    assert r.status_code == 400  # WB-1002 从未封存
+
+    # 对 WB-1002 先封存再解封，复核「解封后不能核对」
+    assert client.post("/api/seals/WB-1002", json={}).status_code == 200
+    assert client.request(
+        "DELETE", "/api/seals/WB-1002", json={"reason": "测试解封"}
+    ).status_code == 200
+    assert client.post("/api/seals/WB-1002/reconcile", json={}).status_code == 404
+
+    ra = client.get("/api/seals/WB-1002/reconcile/attest")
+    assert ra.status_code == 200
+    assert ra.json()["status"] == "unsealed"
+    assert ra.json()["verified"] is None
+
+
+def test_reconcile_failure_leaves_no_draft_row():
+    """模块级：核对失败时草稿被删，事务回滚后库里不存在任何半截核对。"""
+    from app.modules import timeline_hash_seal as mod
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        mod.seal_waybill(conn, "WB-1002")
+        conn.commit()
+        seal_hash = _seal_row(conn, "WB-1002")["content_hash"]
+
+        # 在写事务内制造点序变化，核对必然失败
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO hops(id, waybill_id, event_ts, location_code, event_code, seq, channel) "
+            "VALUES ('H-DRAFT','WB-1002','2026-11-17T23:00:00Z','X','DELIVERED',9,'primary')"
+        )
+        with pytest.raises(mod.SealTamperError):
+            mod.reconcile_seal(conn, "WB-1002")
+        # 失败时草稿已删除
+        assert conn.execute(
+            "SELECT COUNT(*) AS c FROM seal_reconciliations WHERE waybill_id='WB-1002'"
+        ).fetchone()["c"] == 0
+        conn.rollback()
+
+        # 复核：库里没有核对行，点序变化也回滚，封存哈希原样
+        assert conn.execute(
+            "SELECT COUNT(*) AS c FROM seal_reconciliations WHERE waybill_id='WB-1002'"
+        ).fetchone()["c"] == 0
+        assert _seal_row(conn, "WB-1002")["content_hash"] == seal_hash
+        assert mod.is_sealed(conn, "WB-1002") is True
+    finally:
+        conn.close()
+
+
+def test_reconcile_proofs_endpoint_is_readonly(client):
+    r = client.get("/api/seals/WB-1001/reconcile/proofs")
+    assert r.status_code == 200
+    rows = r.json()
+    assert rows and all(x["outcome"] == "passed" for x in rows)
+    assert rows[0]["content_hash"] == rows[0]["recomputed_hash"]

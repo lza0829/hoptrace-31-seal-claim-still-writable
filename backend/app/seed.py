@@ -71,6 +71,21 @@ CREATE TABLE IF NOT EXISTS seal_audit_log (
   actor TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+-- 核对结果证明表（只追加）。核对必须现场重算正式线指纹并与封存值比对，
+-- 一致才把草稿原子转成 passed 证明行；草稿态仅存在于核对事务内部。
+CREATE TABLE IF NOT EXISTS seal_reconciliations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  waybill_id TEXT NOT NULL,
+  content_hash TEXT NOT NULL,          -- 封印行固化的指纹
+  recomputed_hash TEXT,                -- 核对时现场重算的正式线指纹
+  point_count INTEGER,
+  projection TEXT,
+  outcome TEXT NOT NULL DEFAULT 'draft' CHECK (outcome IN ('draft','passed')),
+  mismatches_json TEXT NOT NULL DEFAULT '[]',
+  checked_at TEXT NOT NULL,
+  checked_by TEXT NOT NULL
+);
 """
 
 EVENT_STATUS = {
